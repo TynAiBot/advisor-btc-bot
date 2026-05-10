@@ -295,6 +295,13 @@ ADVISOR_MIN_SCORE = float(os.getenv("ADVISOR_MIN_SCORE", "0.65"))
 ADVISOR_NOTIFY_SKIPS = os.getenv("ADVISOR_NOTIFY_SKIPS", "true").lower() == "true"
 ADVISOR_USE_LIVE_PRICE = os.getenv("ADVISOR_USE_LIVE_PRICE", "true").lower() == "true"
 
+# Extra tijdelijke webhook-debug naar Telegram/logs
+WEBHOOK_NOTIFY_ALL = os.getenv("WEBHOOK_NOTIFY_ALL", "false").lower() == "true"
+WEBHOOK_NOTIFY_SKIPS = os.getenv("WEBHOOK_NOTIFY_SKIPS", "true").lower() == "true"
+WEBHOOK_NOTIFY_RAW_MAX = int(os.getenv("WEBHOOK_NOTIFY_RAW_MAX", "350"))
+LAST_WEBHOOKS: List[Dict[str, Any]] = []
+
+
 ADVISOR_TF = os.getenv("ADVISOR_TF", "10m")
 ADVISOR_OHLCV_LIMIT = int(os.getenv("ADVISOR_OHLCV_LIMIT", "260"))
 ADVISOR_HTF_MINUTES = int(os.getenv("ADVISOR_HTF_MINUTES", "240"))
@@ -356,7 +363,7 @@ def _dbg(msg: str):
     Debug log met timestamp.
     """
     ts = datetime.now(timezone.utc).isoformat()
-    print(f"[{ts}] {msg}")
+    print(f"[{ts}] {msg}", flush=True)
 
 
 def _load_state_file():
@@ -820,6 +827,26 @@ def advisor_tg_skip(symbol: str, action: str, advisor: Dict[str, Any]):
     )
     send_tg(msg)
 
+
+def _record_webhook_event(event: Dict[str, Any]):
+    """Bewaar laatste webhook-events voor /debug/last_webhooks."""
+    try:
+        event["ts_utc"] = datetime.now(timezone.utc).isoformat()
+        LAST_WEBHOOKS.append(event)
+        del LAST_WEBHOOKS[:-25]
+    except Exception as e:
+        _dbg(f"[WEBHOOKDBG] record error: {e}")
+
+
+def tg_webhook_notice(title: str, detail: str):
+    """Tijdelijke Telegram-debugmelding voor webhook/skip-events."""
+    try:
+        if WEBHOOK_NOTIFY_SKIPS:
+            send_tg(f"{BOT_TITLE}\n🧩 {title}\n{detail[:900]}")
+    except Exception as e:
+        _dbg(f"[WEBHOOKDBG] tg notice error: {e}")
+
+
 # ------------- ENDPOINTS -------------
 
 @app.route("/", methods=["GET"])
@@ -903,10 +930,17 @@ def advisor_status():
         "fail_open": os.getenv("ADVISOR_FAIL_OPEN", "false").lower() == "true",
     }), 200
 
+@app.route("/debug/last_webhooks", methods=["GET"])
+def debug_last_webhooks():
+    return jsonify({"last_webhooks": LAST_WEBHOOKS[-25:]}), 200
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     raw = request.get_data(as_text=True)
     _dbg(f"[SIGDBG] /webhook hit ct={request.content_type} raw='{raw[:200]}...'")
+    if WEBHOOK_NOTIFY_ALL:
+        send_tg(f"{BOT_TITLE}\n🧩 WEBHOOK ONTVANGEN\nct={request.content_type}\nraw={raw[:WEBHOOK_NOTIFY_RAW_MAX]}")
+    _record_webhook_event({"stage": "received", "content_type": str(request.content_type), "raw": raw[:WEBHOOK_NOTIFY_RAW_MAX]})
 
     # Parse payload (verwacht JSON van TradingView)
     payload = None
@@ -920,11 +954,15 @@ def webhook():
 
     if payload is None:
         _dbg("[SIGDBG] bad_json")
+        _record_webhook_event({"stage": "bad_json", "raw": raw[:WEBHOOK_NOTIFY_RAW_MAX]})
+        tg_webhook_notice("WEBHOOK geweigerd: bad_json", f"TradingView stuurde geen geldige JSON. Raw={raw[:WEBHOOK_NOTIFY_RAW_MAX]}")
         return jsonify({"ok": True, "skip": "bad_json"}), 200
 
     action = (payload.get("action") or "").lower().strip()
     if action not in ["buy", "sell"]:
         _dbg(f"[SKIP] Invalid action '{action}'")
+        _record_webhook_event({"stage": "invalid_action", "payload": payload})
+        tg_webhook_notice("WEBHOOK geskipt: invalid_action", f"action='{action}' payload={str(payload)[:WEBHOOK_NOTIFY_RAW_MAX]}")
         return jsonify({"ok": True, "skipped": "invalid_action"}), 200
 
     tv_symbol_raw = payload.get("symbol") or ""
@@ -932,6 +970,8 @@ def webhook():
 
     if symbol != SYMBOL:
         _dbg(f"[SKIP] Unknown symbol '{symbol}' (raw='{tv_symbol_raw}')")
+        _record_webhook_event({"stage": "unknown_symbol", "symbol": symbol, "raw_symbol": tv_symbol_raw, "payload": payload})
+        tg_webhook_notice("WEBHOOK geskipt: unknown_symbol", f"raw='{tv_symbol_raw}' parsed='{symbol}' expected='{SYMBOL}'")
         return jsonify({"ok": True, "skip": "unknown_symbol"}), 200
 
     tf_raw = payload.get("tf") or ""
@@ -952,12 +992,15 @@ def webhook():
             price = 0.0
 
     source = payload.get("source", "unknown")
+    _record_webhook_event({"stage": "parsed", "action": action, "symbol": symbol, "tf": tf, "price": price, "source": source, "payload": payload})
 
     # Timeframe allowlist
     try:
         atfs = allowed_tfs_for(symbol)
         if tf not in atfs:
             _dbg(f"[TF FILTER] skip {symbol} tf={tf} not allowed ({', '.join(sorted(atfs))})")
+            _record_webhook_event({"stage": "tf_not_allowed", "symbol": symbol, "tf": tf, "allowed": sorted(atfs), "payload": payload})
+            tg_webhook_notice("WEBHOOK geskipt: tf_not_allowed", f"{symbol} tf={tf} allowed={', '.join(sorted(atfs))}")
             return jsonify({"ok": True, "skip": "tf_not_allowed"}), 200
     except Exception as e:
         _dbg(f"[TF FILTER] warn: {e}")
@@ -980,7 +1023,10 @@ def webhook():
 
     # Strict dedup
     if now - st.get("last_action_ts", 0) < STRICT_DEDUP_S:
-        _dbg(f"[DEDUP] skip {symbol} too soon ({now - st['last_action_ts']:.2f}s)")
+        age_s = now - st.get("last_action_ts", 0)
+        _dbg(f"[DEDUP] skip {symbol} too soon ({age_s:.2f}s)")
+        _record_webhook_event({"stage": "dedup", "symbol": symbol, "action": action, "age_s": age_s, "payload": payload})
+        tg_webhook_notice("WEBHOOK geskipt: dedup", f"{symbol} {action} te snel na vorige actie: {age_s:.2f}s")
         return jsonify({"ok": True, "skip": "dedup"}), 200
 
     # Per-bar lock (5m bars)
@@ -999,6 +1045,8 @@ def webhook():
     # Entry lockout / al in positie
     if action == "buy" and st.get("in_position", False):
         _dbg(f"[POS] skip {symbol} already in_position at entry={st.get('entry_price', 0)}")
+        _record_webhook_event({"stage": "in_position", "symbol": symbol, "action": action, "entry": st.get("entry_price", 0), "payload": payload})
+        tg_webhook_notice("BUY geskipt: al in positie", f"{symbol} entry={st.get('entry_price', 0)}")
         return jsonify({"ok": True, "skip": "in_position"}), 200
 
     # Min cooldown
@@ -1120,6 +1168,8 @@ def _market_sell_all(symbol: str, price: float, source: str = "", tf: str = "") 
     st = STATE[symbol]
     if not st.get("in_position", False):
         _dbg(f"[SELL] skip {symbol} no position")
+        _record_webhook_event({"stage": "sell_no_position", "symbol": symbol, "source": source, "tf": tf})
+        tg_webhook_notice("SELL geskipt: geen positie", f"{symbol} source={source} tf={tf}")
         return jsonify({"ok": True, "skip": "no_position"}), 200
 
     st["inflight"] = True
