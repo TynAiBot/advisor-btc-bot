@@ -7,7 +7,9 @@ MEXC single-pair webhook bot (BTC/USDT) met Telegram alerts.
 - Optionele REHYDRATE_ENABLED (default uit, raakt je bestaande holdings niet)
 - Dedup, per-symbol state, inflight guard
 - Per-candle lock: max 1 BUY/SELL per 5m-bar
-- Virtuele wallet: trade_usd + savings_usd, bij verlies aanvullen vanuit spaarpot
+- Virtuele wallet: trade_usd + savings_usd + realized_pnl_usd met auditregels
+- Optionele bot-filters op TV payload: EMA200/EMA50/VWAP/RSI/RSI_MA
+- Optionele bot TP/SL/trailing monitor via MEXC ticker
 - Endpoints: /, /health, /config, /envcheck, /test/send, /webhook
 """
 
@@ -18,7 +20,7 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from threading import Lock, Thread
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Dict, Any, Tuple, List
 
 import requests
 from flask import Flask, request, jsonify
@@ -123,12 +125,35 @@ def eur_rate() -> float:
     return float(os.getenv("USD_TO_EUR", "0.92"))
 
 
-def savings_for(symbol: str) -> float:
+def env_bool(key: str, default: str = "false") -> bool:
+    return os.getenv(key, default).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def env_float(key: str, default: str) -> float:
+    try:
+        return float(os.getenv(key, default))
+    except Exception:
+        return float(default)
+
+
+def payload_float(payload: Dict[str, Any], *keys: str) -> float | None:
     """
-    Savings balance voor symbol in EUR (placeholder als je ooit echte spaarrekening gaat tracken).
-    Hier gebruiken we de virtuele wallet in STATE, niet deze functie.
+    Haal een indicatorwaarde uit TradingView JSON. Accepteert meerdere key-namen.
+    Voorbeelden: rsi, rsi_ma, ema50, ema200, vwap.
     """
-    return 0.0
+    for key in keys:
+        if key in payload and payload.get(key) not in (None, ""):
+            try:
+                return float(payload.get(key))
+            except Exception:
+                return None
+    return None
+
+
+def pct_change(from_price: float, to_price: float) -> float:
+    if from_price <= 0:
+        return 0.0
+    return (to_price / from_price - 1.0) * 100.0
 
 
 # ------------- wallet helpers -------------
@@ -180,6 +205,7 @@ def _ensure_wallet(symbol: str):
     st.setdefault("target_trade_usd", target_trade)
     st.setdefault("trade_usd", target_trade)
     st.setdefault("savings_usd", savings)
+    st.setdefault("realized_pnl_usd", 0.0)
     STATE[symbol] = st
 
 
@@ -203,10 +229,11 @@ def tg_buy_msg(symbol: str, price_usd: float, qty: float, invested_usd: float) -
     return "\n".join(lines)
 
 
-def tg_sell_msg(symbol: str, price_usd: float, qty: float, net_out_usd: float, pnl_usd: float) -> str:
+def tg_sell_msg(symbol: str, price_usd: float, qty: float, net_out_usd: float, pnl_usd: float,
+                prev_trade_usd: float | None = None, prev_savings_usd: float | None = None) -> str:
     """
     TG message voor SELL.
-    Toont actuele virtuele handels- en spaar-saldo.
+    Toont actuele virtuele handels- en spaar-saldo plus auditregel.
     """
     trade_usd, savings_usd = trade_and_savings_usd(symbol)
     trade_eur = eur_rate() * trade_usd
@@ -216,6 +243,7 @@ def tg_sell_msg(symbol: str, price_usd: float, qty: float, net_out_usd: float, p
     now_str = fmt_dt(local_now())
     sym_ccxt = sym_label(symbol)
     pnl_eur = eur_rate() * pnl_usd
+    realized_eur = eur_rate() * float(STATE.get(symbol, {}).get("realized_pnl_usd", 0.0))
     winlose = "Winst" if pnl_eur >= 0 else "Verlies"
     lines = [
         f"{BOT_TITLE}",
@@ -225,10 +253,18 @@ def tg_sell_msg(symbol: str, price_usd: float, qty: float, net_out_usd: float, p
         f"💰 Handelssaldo: {fmt_eur(trade_eur)}",
         f"💼 Spaarrekening: {fmt_eur(savings_eur)}",
         f"📈 Totale waarde: {fmt_eur(total_eur)}",
+        f"📊 Cumulatieve PnL: {fmt_eur(realized_eur)}",
         f"🔐 Tradebedrag: {fmt_eur(trade_eur)}",
+    ]
+    if prev_trade_usd is not None and prev_savings_usd is not None:
+        lines.append(
+            f"🧾 Wallet: {fmt_eur(eur_rate() * prev_trade_usd)} + {fmt_eur(eur_rate() * prev_savings_usd)} "
+            f"{fmt_eur(pnl_eur)} → {fmt_eur(total_eur)}"
+        )
+    lines.extend([
         f"🔗 Tijd: {now_str}",
         f"🧪 Modus: {'PAPER' if SIMULATE else 'LIVE'}",
-    ]
+    ])
     return "\n".join(lines)
 
 
@@ -288,52 +324,24 @@ PER_BAR_LOCK_SELL = os.getenv("PER_BAR_LOCK_SELL", "false").lower() == "true"
 SPAREN_ENABLED = os.getenv("SPAREN_ENABLED", "true").lower() == "true"
 SPAREN_SPLIT_PCT = float(os.getenv("SPAREN_SPLIT_PCT", "100"))
 
-# ------------- ADVISOR / QUALITY GATE -------------
+# ------------- optionele bot-filters op TV payload -------------
+# Let op: deze filters werken alleen als TradingView de waarden meestuurt in de alert JSON.
+BOT_FILTER_ENABLED = env_bool("BOT_FILTER_ENABLED", "false")
+BOT_FILTER_MISSING = os.getenv("BOT_FILTER_MISSING", "open").strip().lower()  # open of closed
+BUY_REQUIRE_CLOSE_ABOVE_EMA200 = env_bool("BUY_REQUIRE_CLOSE_ABOVE_EMA200", "true")
+BUY_REQUIRE_EMA50_ABOVE_EMA200 = env_bool("BUY_REQUIRE_EMA50_ABOVE_EMA200", "true")
+BUY_REQUIRE_CLOSE_ABOVE_VWAP = env_bool("BUY_REQUIRE_CLOSE_ABOVE_VWAP", "false")
+BUY_REQUIRE_RSI_ABOVE_RSI_MA = env_bool("BUY_REQUIRE_RSI_ABOVE_RSI_MA", "true")
+BUY_RSI_MAX = env_float("BUY_RSI_MAX", "72")
 
-ADVISOR_ENABLED = os.getenv("ADVISOR_ENABLED", "true").lower() == "true"
-ADVISOR_MIN_SCORE = float(os.getenv("ADVISOR_MIN_SCORE", "0.65"))
-ADVISOR_NOTIFY_SKIPS = os.getenv("ADVISOR_NOTIFY_SKIPS", "true").lower() == "true"
-ADVISOR_USE_LIVE_PRICE = os.getenv("ADVISOR_USE_LIVE_PRICE", "true").lower() == "true"
-
-# Extra tijdelijke webhook-debug naar Telegram/logs
-WEBHOOK_NOTIFY_ALL = os.getenv("WEBHOOK_NOTIFY_ALL", "false").lower() == "true"
-WEBHOOK_NOTIFY_SKIPS = os.getenv("WEBHOOK_NOTIFY_SKIPS", "true").lower() == "true"
-WEBHOOK_NOTIFY_RAW_MAX = int(os.getenv("WEBHOOK_NOTIFY_RAW_MAX", "350"))
-LAST_WEBHOOKS: List[Dict[str, Any]] = []
-
-
-ADVISOR_TF = os.getenv("ADVISOR_TF", "10m")
-ADVISOR_OHLCV_LIMIT = int(os.getenv("ADVISOR_OHLCV_LIMIT", "260"))
-ADVISOR_HTF_MINUTES = int(os.getenv("ADVISOR_HTF_MINUTES", "240"))
-MAX_TRADES_PER_HTF_REGIME = int(os.getenv("MAX_TRADES_PER_HTF_REGIME", "1"))
-
-LOSS_COOLDOWN_MINUTES = float(os.getenv("LOSS_COOLDOWN_MINUTES", "720"))
-MAX_ALERT_PRICE_DEVIATION_PCT = float(os.getenv("MAX_ALERT_PRICE_DEVIATION_PCT", "0.15"))
-
-EMA_FAST_LEN = int(os.getenv("ADVISOR_EMA_FAST", "34"))
-EMA_MID_LEN = int(os.getenv("ADVISOR_EMA_MID", "89"))
-EMA_SLOW_LEN = int(os.getenv("ADVISOR_EMA_SLOW", "144"))
-EMA_TREND_LEN = int(os.getenv("EMA_TREND_LEN", "200"))
-REQUIRE_EMA200_UP = os.getenv("REQUIRE_EMA200_UP", "true").lower() == "true"
-EMA_SLOPE_LOOKBACK = int(os.getenv("EMA_SLOPE_LOOKBACK", "5"))
-MIN_EMA_SPREAD_PCT = float(os.getenv("MIN_EMA_SPREAD_PCT", "0.05"))
-
-MIN_ADX = float(os.getenv("MIN_ADX", "18"))
-ADX_LEN = int(os.getenv("ADX_LEN", "14"))
-ADX_SMOOTH = int(os.getenv("ADX_SMOOTH", "14"))
-ADVISOR_RSI_LEN = int(os.getenv("ADVISOR_RSI_LEN", "14"))
-ADVISOR_RSI_MIN_LONG = float(os.getenv("ADVISOR_RSI_MIN_LONG", "48"))
-ADVISOR_RSI_MAX_LONG = float(os.getenv("ADVISOR_RSI_MAX_LONG", "78"))
-ATR_LEN = int(os.getenv("ATR_LEN", "14"))
-MIN_ATR_PCT = float(os.getenv("MIN_ATR_PCT", "0.10"))
-MAX_ATR_PCT = float(os.getenv("MAX_ATR_PCT", "1.20"))
-
-USE_VOLUME_FILTER = os.getenv("USE_VOLUME_FILTER", "true").lower() == "true"
-VOLUME_MA_LEN = int(os.getenv("VOLUME_MA_LEN", "20"))
-MIN_VOLUME_FACTOR = float(os.getenv("MIN_VOLUME_FACTOR", "0.80"))
-
-BLOCK_AFTER_BIG_CANDLE = os.getenv("BLOCK_AFTER_BIG_CANDLE", "true").lower() == "true"
-MAX_CANDLE_ATR_MULT = float(os.getenv("MAX_CANDLE_ATR_MULT", "2.50"))
+# ------------- optionele bot TP/SL/trailing monitor -------------
+BOT_TPSL_ENABLED = env_bool("BOT_TPSL_ENABLED", "false")
+TPSL_POLL_S = env_float("TPSL_POLL_S", "15")
+HARD_SL_PCT = env_float("HARD_SL_PCT", "0.90")          # verkoop bij -0.90%
+BE_TRIGGER_PCT = env_float("BE_TRIGGER_PCT", "0.60")    # break-even actief vanaf +0.60%
+BE_OFFSET_PCT = env_float("BE_OFFSET_PCT", "0.05")      # BE stop op entry +0.05%
+TRAIL_TRIGGER_PCT = env_float("TRAIL_TRIGGER_PCT", "1.00")
+TRAIL_DISTANCE_PCT = env_float("TRAIL_DISTANCE_PCT", "0.45")
 
 # ✅ Symbol uit ENV (fallback BTC/USDT)
 SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
@@ -363,7 +371,7 @@ def _dbg(msg: str):
     Debug log met timestamp.
     """
     ts = datetime.now(timezone.utc).isoformat()
-    print(f"[{ts}] {msg}", flush=True)
+    print(f"[{ts}] {msg}")
 
 
 def _load_state_file():
@@ -421,29 +429,26 @@ def allowed_tfs_for(symbol: str) -> set:
 
 def init_exchange():
     """
-    Init MEXC client.
-    In SIMULATE wordt een publieke MEXC-client gestart, zodat de advisor live candles
-    en tickerdata kan ophalen zonder echte orders te plaatsen.
+    Init MEXC client. In SIMULATE gebruiken we alleen publieke ticker-data
+    zodat de TP/SL/trailing monitor ook in PAPER kan werken.
     """
     global ex
-
-    cfg = {
+    params = {
         "sandbox": False,
         "enableRateLimit": True,
         "options": {"recvWindow": MEXC_RECVWINDOW_MS},
         "timeout": CCXT_TIMEOUT_MS,
     }
-
     if not SIMULATE:
-        cfg["apiKey"] = MEXC_API_KEY
-        cfg["secret"] = MEXC_API_SECRET
-        _dbg("[WARMUP] LIVE mode: exchange init with API keys")
-    else:
-        _dbg("[WARMUP] SIMULATE mode: public exchange init for advisor only")
+        params["apiKey"] = MEXC_API_KEY
+        params["secret"] = MEXC_API_SECRET
 
-    ex = ccxt.mexc(cfg)
+    ex = ccxt.mexc(params)
     ex.load_markets()
-    _dbg("[WARMUP] MEXC client ready")
+    if SIMULATE:
+        _dbg("[WARMUP] SIMULATE mode: public MEXC client ready for ticker/TP-SL only")
+    else:
+        _dbg("[WARMUP] MEXC client ready")
 
 
 def rehydrate_positions():
@@ -503,6 +508,117 @@ def rehydrate_positions():
         _dbg(f"[REHYDRATE] Fetch error: {e}")
 
 
+def bot_filter_decision(action: str, price: float, payload: Dict[str, Any]) -> tuple[bool, str]:
+    """
+    Extra bot-side filter. Werkt alleen als TV indicatorwaarden meestuurt.
+    Bij BOT_FILTER_MISSING=open worden ontbrekende waarden niet geblokkeerd.
+    """
+    if not BOT_FILTER_ENABLED or action != "buy":
+        return True, "filter_disabled_or_not_buy"
+
+    missing_policy_closed = BOT_FILTER_MISSING == "closed"
+    checks: list[tuple[bool | None, str]] = []
+
+    close = payload_float(payload, "close", "price") or price
+    ema200 = payload_float(payload, "ema200", "ema_200", "ma200")
+    ema50 = payload_float(payload, "ema50", "ema_50", "ma50")
+    vwap = payload_float(payload, "vwap")
+    rsi = payload_float(payload, "rsi")
+    rsi_ma = payload_float(payload, "rsi_ma", "rsima", "rsiMA")
+
+    def check_available(condition: bool | None, name: str):
+        checks.append((condition, name))
+
+    if BUY_REQUIRE_CLOSE_ABOVE_EMA200:
+        check_available(None if ema200 is None else close > ema200, "close>ema200")
+    if BUY_REQUIRE_EMA50_ABOVE_EMA200:
+        check_available(None if ema50 is None or ema200 is None else ema50 > ema200, "ema50>ema200")
+    if BUY_REQUIRE_CLOSE_ABOVE_VWAP:
+        check_available(None if vwap is None else close > vwap, "close>vwap")
+    if BUY_REQUIRE_RSI_ABOVE_RSI_MA:
+        check_available(None if rsi is None or rsi_ma is None else rsi > rsi_ma, "rsi>rsi_ma")
+    if BUY_RSI_MAX > 0:
+        check_available(None if rsi is None else rsi <= BUY_RSI_MAX, f"rsi<={BUY_RSI_MAX:g}")
+
+    failed = [name for ok, name in checks if ok is False]
+    missing = [name for ok, name in checks if ok is None]
+
+    if failed:
+        return False, "failed:" + ",".join(failed)
+    if missing and missing_policy_closed:
+        return False, "missing:" + ",".join(missing)
+    if missing:
+        return True, "pass_missing_open:" + ",".join(missing)
+    return True, "pass"
+
+
+def update_trade_protection_state(symbol: str, price: float):
+    """
+    Houd highest_price, break-even en trailing stop in STATE bij.
+    Dit verandert niets aan de TradingView strategie; dit is bot-risk-management.
+    """
+    st = STATE.get(symbol, {})
+    if not st.get("in_position", False):
+        return
+    entry = float(st.get("entry_price", 0.0))
+    if entry <= 0 or price <= 0:
+        return
+
+    highest = max(float(st.get("highest_price", entry)), price)
+    st["highest_price"] = highest
+    profit_pct = pct_change(entry, price)
+
+    stop_candidates = []
+    hard_sl_price = entry * (1.0 - HARD_SL_PCT / 100.0)
+    stop_candidates.append((hard_sl_price, "hard_sl"))
+
+    if profit_pct >= BE_TRIGGER_PCT or st.get("be_armed", False):
+        st["be_armed"] = True
+        be_price = entry * (1.0 + BE_OFFSET_PCT / 100.0)
+        stop_candidates.append((be_price, "break_even"))
+
+    if pct_change(entry, highest) >= TRAIL_TRIGGER_PCT or st.get("trail_armed", False):
+        st["trail_armed"] = True
+        trail_price = highest * (1.0 - TRAIL_DISTANCE_PCT / 100.0)
+        stop_candidates.append((trail_price, "trailing"))
+
+    active_stop, reason = max(stop_candidates, key=lambda x: x[0])
+    st["active_stop_price"] = active_stop
+    st["active_stop_reason"] = reason
+
+
+def _tpsl_monitor_loop():
+    """
+    Optionele actieve monitor. Als BOT_TPSL_ENABLED=true, kan de bot zelf verkopen
+    op hard SL, break-even of trailing stop, ook zonder SELL alert uit TradingView.
+    """
+    while True:
+        try:
+            time.sleep(max(5.0, TPSL_POLL_S))
+            if not BOT_TPSL_ENABLED:
+                continue
+            if ex is None:
+                continue
+            symbol = SYMBOL
+            st = STATE.get(symbol, {})
+            if not st.get("in_position", False) or st.get("inflight", False):
+                continue
+            ticker = ex.fetch_ticker(symbol)
+            price = float(ticker.get("last") or 0.0)
+            if price <= 0:
+                continue
+
+            update_trade_protection_state(symbol, price)
+            stop_price = float(st.get("active_stop_price", 0.0))
+            reason = st.get("active_stop_reason", "")
+            if stop_price > 0 and price <= stop_price:
+                _dbg(f"[TPSL] trigger {symbol} reason={reason} price={price} stop={stop_price}")
+                _market_sell_all(symbol, price, source=f"bot_tpsl_{reason}", tf="bot")
+        except Exception as e:
+            _dbg(f"[TPSL] loop error: {e}")
+            time.sleep(10)
+
+
 def _daily_report_loop():
     """
     Dagelijkse report-thread (placeholder).
@@ -524,329 +640,6 @@ def _daily_report_loop():
             time.sleep(3600)
 
 
-
-# ------------- ADVISOR HELPERS -------------
-
-def _ema(values: List[float], length: int) -> List[Optional[float]]:
-    """Exponential moving average zonder externe libraries."""
-    if length <= 0 or not values:
-        return [None] * len(values)
-    out: List[Optional[float]] = [None] * len(values)
-    k = 2.0 / (length + 1.0)
-    ema_val: Optional[float] = None
-    for i, v in enumerate(values):
-        if ema_val is None:
-            ema_val = v
-        else:
-            ema_val = v * k + ema_val * (1.0 - k)
-        if i >= length - 1:
-            out[i] = ema_val
-    return out
-
-
-def _rma(values: List[float], length: int) -> List[Optional[float]]:
-    """Wilder RMA, gebruikt voor ATR/ADX/RSI."""
-    out: List[Optional[float]] = [None] * len(values)
-    if length <= 0 or len(values) < length:
-        return out
-    acc = sum(values[:length]) / length
-    out[length - 1] = acc
-    for i in range(length, len(values)):
-        acc = (acc * (length - 1) + values[i]) / length
-        out[i] = acc
-    return out
-
-
-def _last_valid(vals: List[Optional[float]], default: float = 0.0) -> float:
-    for v in reversed(vals):
-        if v is not None:
-            return float(v)
-    return default
-
-
-def _calc_indicators(ohlcv: List[List[float]]) -> Dict[str, float]:
-    """
-    Verwacht ccxt OHLCV: [ts, open, high, low, close, volume].
-    Retourneert alleen de laatste bevestigde candle-waarden.
-    """
-    if len(ohlcv) < max(EMA_TREND_LEN, ADX_LEN + ADX_SMOOTH, ATR_LEN, VOLUME_MA_LEN, ADVISOR_RSI_LEN) + 10:
-        raise ValueError(f"not_enough_candles:{len(ohlcv)}")
-
-    opens = [float(x[1]) for x in ohlcv]
-    highs = [float(x[2]) for x in ohlcv]
-    lows = [float(x[3]) for x in ohlcv]
-    closes = [float(x[4]) for x in ohlcv]
-    vols = [float(x[5]) for x in ohlcv]
-
-    # Gebruik de laatste volledig teruggegeven candle. Bij ccxt kan de allerlaatste candle nog lopen.
-    # Daarom gebruiken we index -2 als confirmed candle waar mogelijk.
-    idx = -2 if len(closes) >= 2 else -1
-
-    ema_fast = _ema(closes, EMA_FAST_LEN)
-    ema_mid = _ema(closes, EMA_MID_LEN)
-    ema_slow = _ema(closes, EMA_SLOW_LEN)
-    ema_trend = _ema(closes, EMA_TREND_LEN)
-
-    # ATR
-    tr: List[float] = [0.0]
-    for i in range(1, len(closes)):
-        tr.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
-    atr_arr = _rma(tr, ATR_LEN)
-
-    # ADX / DMI
-    plus_dm = [0.0]
-    minus_dm = [0.0]
-    for i in range(1, len(closes)):
-        up = highs[i] - highs[i - 1]
-        down = lows[i - 1] - lows[i]
-        plus_dm.append(up if up > down and up > 0 else 0.0)
-        minus_dm.append(down if down > up and down > 0 else 0.0)
-
-    tr_rma = _rma(tr, ADX_LEN)
-    plus_rma = _rma(plus_dm, ADX_LEN)
-    minus_rma = _rma(minus_dm, ADX_LEN)
-    dx: List[float] = []
-    for i in range(len(closes)):
-        if tr_rma[i] is None or tr_rma[i] == 0:
-            dx.append(0.0)
-            continue
-        pdi = 100.0 * (plus_rma[i] or 0.0) / tr_rma[i]
-        mdi = 100.0 * (minus_rma[i] or 0.0) / tr_rma[i]
-        denom = pdi + mdi
-        dx.append(0.0 if denom == 0 else 100.0 * abs(pdi - mdi) / denom)
-    adx_arr = _rma(dx, ADX_SMOOTH)
-
-    # RSI
-    gains = [0.0]
-    losses = [0.0]
-    for i in range(1, len(closes)):
-        ch = closes[i] - closes[i - 1]
-        gains.append(max(ch, 0.0))
-        losses.append(max(-ch, 0.0))
-    avg_gain = _rma(gains, ADVISOR_RSI_LEN)
-    avg_loss = _rma(losses, ADVISOR_RSI_LEN)
-    rsi_arr: List[Optional[float]] = [None] * len(closes)
-    for i in range(len(closes)):
-        if avg_gain[i] is None or avg_loss[i] is None:
-            continue
-        if avg_loss[i] == 0:
-            rsi_arr[i] = 100.0
-        else:
-            rs = avg_gain[i] / avg_loss[i]
-            rsi_arr[i] = 100.0 - (100.0 / (1.0 + rs))
-
-    vol_ma = _ema(vols, VOLUME_MA_LEN)
-
-    c = closes[idx]
-    atr = float(atr_arr[idx] or 0.0)
-    atr_pct = 100.0 * atr / c if c > 0 else 0.0
-    candle_range = highs[idx] - lows[idx]
-    candle_atr_mult = candle_range / atr if atr > 0 else 0.0
-
-    et = float(ema_trend[idx] or 0.0)
-    et_prev_i = idx - EMA_SLOPE_LOOKBACK
-    et_prev = float(ema_trend[et_prev_i] or et) if abs(et_prev_i) <= len(ema_trend) else et
-    ema_slope_up = et > et_prev
-
-    ef = float(ema_fast[idx] or 0.0)
-    em = float(ema_mid[idx] or 0.0)
-    es = float(ema_slow[idx] or 0.0)
-    spread_pct = 100.0 * abs(ef - es) / c if c > 0 else 0.0
-
-    vm = float(vol_ma[idx] or 0.0)
-    vf = vols[idx] / vm if vm > 0 else 0.0
-
-    return {
-        "close": c,
-        "ema_fast": ef,
-        "ema_mid": em,
-        "ema_slow": es,
-        "ema_trend": et,
-        "ema_slope_up": 1.0 if ema_slope_up else 0.0,
-        "ema_spread_pct": spread_pct,
-        "atr": atr,
-        "atr_pct": atr_pct,
-        "adx": float(adx_arr[idx] or 0.0),
-        "rsi": float(rsi_arr[idx] or 0.0),
-        "vol_factor": vf,
-        "candle_atr_mult": candle_atr_mult,
-    }
-
-
-def _advisor_htf_key(now_s: float) -> int:
-    """Bucket-key voor max aantal entries per HTF-blok."""
-    bucket_s = max(1, ADVISOR_HTF_MINUTES) * 60
-    return int(now_s // bucket_s)
-
-
-def advisor_check_buy(symbol: str, alert_price: float, source: str = "", tf: str = "") -> Dict[str, Any]:
-    """
-    Trade Quality Gate voor BUY-signalen.
-    SELL-signalen blijven exits en worden niet door deze advisor geblokkeerd.
-    """
-    if not ADVISOR_ENABLED:
-        return {"allow": True, "score": 1.0, "reason": "advisor_disabled", "live_price": alert_price}
-
-    st = STATE.get(symbol, {})
-    now_s = time.time()
-    hard_blocks: List[str] = []
-    notes: List[str] = []
-    score = 0.0
-    max_score = 0.0
-
-    # Cooldown na verlies
-    last_loss_ts = float(st.get("last_loss_ts", 0.0) or 0.0)
-    if LOSS_COOLDOWN_MINUTES > 0 and last_loss_ts > 0:
-        age_min = (now_s - last_loss_ts) / 60.0
-        if age_min < LOSS_COOLDOWN_MINUTES:
-            hard_blocks.append(f"loss_cooldown {age_min:.0f}/{LOSS_COOLDOWN_MINUTES:.0f}m")
-
-    # Max 1 trade per HTF regime/bucket
-    if MAX_TRADES_PER_HTF_REGIME > 0:
-        key = _advisor_htf_key(now_s)
-        if int(st.get("last_buy_htf_key", -999999)) == key:
-            hard_blocks.append(f"htf_trade_limit bucket={key}")
-
-    live_price = alert_price
-    try:
-        if ex is not None:
-            ticker = ex.fetch_ticker(symbol)
-            live_price = float(ticker.get("last") or alert_price)
-    except Exception as e:
-        notes.append(f"ticker_warn:{e}")
-
-    # TV-alertprijs vs actuele MEXC-prijs
-    max_score += 0.10
-    if alert_price > 0 and live_price > 0:
-        dev_pct = 100.0 * abs(live_price - alert_price) / alert_price
-        if dev_pct > MAX_ALERT_PRICE_DEVIATION_PCT:
-            hard_blocks.append(f"price_deviation {dev_pct:.3f}%>{MAX_ALERT_PRICE_DEVIATION_PCT:.3f}%")
-        else:
-            score += 0.10
-    else:
-        notes.append("no_price_deviation_check")
-
-    try:
-        if ex is None:
-            raise ValueError("exchange_not_ready")
-        ohlcv = ex.fetch_ohlcv(symbol, timeframe=ADVISOR_TF, limit=ADVISOR_OHLCV_LIMIT)
-        ind = _calc_indicators(ohlcv)
-    except Exception as e:
-        if os.getenv("ADVISOR_FAIL_OPEN", "false").lower() == "true":
-            return {"allow": True, "score": 0.0, "reason": f"advisor_fail_open:{e}", "live_price": live_price}
-        return {"allow": False, "score": 0.0, "reason": f"advisor_data_error:{e}", "live_price": live_price}
-
-    # Trend: long alleen boven EMA200 / EMA-structuur
-    max_score += 0.25
-    trend_ok = live_price > ind["ema_trend"] and ind["ema_fast"] > ind["ema_mid"] > ind["ema_slow"]
-    if REQUIRE_EMA200_UP:
-        trend_ok = trend_ok and bool(ind["ema_slope_up"])
-    if trend_ok:
-        score += 0.25
-    else:
-        hard_blocks.append("trend_not_ok")
-
-    # EMA spread tegen chop
-    max_score += 0.10
-    if ind["ema_spread_pct"] >= MIN_EMA_SPREAD_PCT:
-        score += 0.10
-    else:
-        hard_blocks.append(f"ema_spread_low {ind['ema_spread_pct']:.3f}%<{MIN_EMA_SPREAD_PCT:.3f}%")
-
-    # ADX
-    max_score += 0.15
-    if ind["adx"] >= MIN_ADX:
-        score += 0.15
-    else:
-        notes.append(f"adx_low {ind['adx']:.1f}<{MIN_ADX:.1f}")
-
-    # ATR% bereik
-    max_score += 0.15
-    if MIN_ATR_PCT <= ind["atr_pct"] <= MAX_ATR_PCT:
-        score += 0.15
-    else:
-        hard_blocks.append(f"atr_pct_bad {ind['atr_pct']:.3f}% not {MIN_ATR_PCT:.3f}-{MAX_ATR_PCT:.3f}%")
-
-    # RSI: niet te zwak, niet extreem overbought
-    max_score += 0.10
-    if ADVISOR_RSI_MIN_LONG <= ind["rsi"] <= ADVISOR_RSI_MAX_LONG:
-        score += 0.10
-    else:
-        notes.append(f"rsi_out {ind['rsi']:.1f}")
-
-    # Volume
-    max_score += 0.05
-    if not USE_VOLUME_FILTER or ind["vol_factor"] >= MIN_VOLUME_FACTOR:
-        score += 0.05
-    else:
-        notes.append(f"vol_low x{ind['vol_factor']:.2f}<x{MIN_VOLUME_FACTOR:.2f}")
-
-    # Grote spike-candle vermijden
-    max_score += 0.10
-    if not BLOCK_AFTER_BIG_CANDLE or ind["candle_atr_mult"] <= MAX_CANDLE_ATR_MULT:
-        score += 0.10
-    else:
-        hard_blocks.append(f"big_candle {ind['candle_atr_mult']:.2f}ATR>{MAX_CANDLE_ATR_MULT:.2f}ATR")
-
-    norm_score = score / max_score if max_score > 0 else 0.0
-    allow = not hard_blocks and norm_score >= ADVISOR_MIN_SCORE
-
-    reason_bits = []
-    if hard_blocks:
-        reason_bits.append("blocks=" + "; ".join(hard_blocks))
-    if notes:
-        reason_bits.append("notes=" + "; ".join(notes))
-    reason_bits.append(
-        f"score={norm_score:.2f} adx={ind['adx']:.1f} rsi={ind['rsi']:.1f} "
-        f"atr%={ind['atr_pct']:.3f} spread%={ind['ema_spread_pct']:.3f} volx={ind['vol_factor']:.2f}"
-    )
-
-    return {
-        "allow": allow,
-        "score": round(norm_score, 3),
-        "reason": " | ".join(reason_bits),
-        "live_price": live_price,
-        "indicators": ind,
-        "source": source,
-        "tf": tf,
-    }
-
-
-def advisor_tg_skip(symbol: str, action: str, advisor: Dict[str, Any]):
-    """Telegram-melding voor geweigerde advisor-trades."""
-    if not ADVISOR_NOTIFY_SKIPS:
-        return
-    sym_ccxt = sym_label(symbol)
-    msg = (
-        f"{BOT_TITLE}\n"
-        f"🧠❌ [{sym_ccxt}] {action.upper()} geweigerd door advisor\n"
-        f"Score: {advisor.get('score', 0)} / min {ADVISOR_MIN_SCORE}\n"
-        f"Reden: {advisor.get('reason', '')}\n"
-        f"Tijd: {fmt_dt(local_now())}\n"
-        f"Modus: {'PAPER' if SIMULATE else 'LIVE'}"
-    )
-    send_tg(msg)
-
-
-def _record_webhook_event(event: Dict[str, Any]):
-    """Bewaar laatste webhook-events voor /debug/last_webhooks."""
-    try:
-        event["ts_utc"] = datetime.now(timezone.utc).isoformat()
-        LAST_WEBHOOKS.append(event)
-        del LAST_WEBHOOKS[:-25]
-    except Exception as e:
-        _dbg(f"[WEBHOOKDBG] record error: {e}")
-
-
-def tg_webhook_notice(title: str, detail: str):
-    """Tijdelijke Telegram-debugmelding voor webhook/skip-events."""
-    try:
-        if WEBHOOK_NOTIFY_SKIPS:
-            send_tg(f"{BOT_TITLE}\n🧩 {title}\n{detail[:900]}")
-    except Exception as e:
-        _dbg(f"[WEBHOOKDBG] tg notice error: {e}")
-
-
 # ------------- ENDPOINTS -------------
 
 @app.route("/", methods=["GET"])
@@ -856,9 +649,13 @@ def home():
         "symbols": SYMBOLS,
         "simulate": SIMULATE,
         "rehydrate_enabled": REHYDRATE_ENABLED,
-        "advisor_enabled": ADVISOR_ENABLED,
-        "advisor_min_score": ADVISOR_MIN_SCORE,
-        "advisor_tf": ADVISOR_TF,
+        "bot_filter_enabled": BOT_FILTER_ENABLED,
+        "bot_filter_missing": BOT_FILTER_MISSING,
+        "bot_tpsl_enabled": BOT_TPSL_ENABLED,
+        "hard_sl_pct": HARD_SL_PCT,
+        "be_trigger_pct": BE_TRIGGER_PCT,
+        "trail_trigger_pct": TRAIL_TRIGGER_PCT,
+        "trail_distance_pct": TRAIL_DISTANCE_PCT,
     }), 200
 
 
@@ -878,9 +675,6 @@ def config():
         "per_bar_lock": PER_BAR_LOCK,
         "simulate": SIMULATE,
         "rehydrate_enabled": REHYDRATE_ENABLED,
-        "advisor_enabled": ADVISOR_ENABLED,
-        "advisor_min_score": ADVISOR_MIN_SCORE,
-        "advisor_tf": ADVISOR_TF,
     }), 200
 
 
@@ -908,39 +702,10 @@ def test_send():
     return jsonify({"ok": True}), 200
 
 
-
-@app.route("/advisor/status", methods=["GET"])
-def advisor_status():
-    return jsonify({
-        "enabled": ADVISOR_ENABLED,
-        "min_score": ADVISOR_MIN_SCORE,
-        "tf": ADVISOR_TF,
-        "ohlcv_limit": ADVISOR_OHLCV_LIMIT,
-        "htf_minutes": ADVISOR_HTF_MINUTES,
-        "max_trades_per_htf_regime": MAX_TRADES_PER_HTF_REGIME,
-        "loss_cooldown_minutes": LOSS_COOLDOWN_MINUTES,
-        "max_alert_price_deviation_pct": MAX_ALERT_PRICE_DEVIATION_PCT,
-        "min_adx": MIN_ADX,
-        "min_atr_pct": MIN_ATR_PCT,
-        "max_atr_pct": MAX_ATR_PCT,
-        "ema_trend_len": EMA_TREND_LEN,
-        "min_ema_spread_pct": MIN_EMA_SPREAD_PCT,
-        "volume_filter": USE_VOLUME_FILTER,
-        "min_volume_factor": MIN_VOLUME_FACTOR,
-        "fail_open": os.getenv("ADVISOR_FAIL_OPEN", "false").lower() == "true",
-    }), 200
-
-@app.route("/debug/last_webhooks", methods=["GET"])
-def debug_last_webhooks():
-    return jsonify({"last_webhooks": LAST_WEBHOOKS[-25:]}), 200
-
 @app.route("/webhook", methods=["POST"])
 def webhook():
     raw = request.get_data(as_text=True)
     _dbg(f"[SIGDBG] /webhook hit ct={request.content_type} raw='{raw[:200]}...'")
-    if WEBHOOK_NOTIFY_ALL:
-        send_tg(f"{BOT_TITLE}\n🧩 WEBHOOK ONTVANGEN\nct={request.content_type}\nraw={raw[:WEBHOOK_NOTIFY_RAW_MAX]}")
-    _record_webhook_event({"stage": "received", "content_type": str(request.content_type), "raw": raw[:WEBHOOK_NOTIFY_RAW_MAX]})
 
     # Parse payload (verwacht JSON van TradingView)
     payload = None
@@ -954,15 +719,11 @@ def webhook():
 
     if payload is None:
         _dbg("[SIGDBG] bad_json")
-        _record_webhook_event({"stage": "bad_json", "raw": raw[:WEBHOOK_NOTIFY_RAW_MAX]})
-        tg_webhook_notice("WEBHOOK geweigerd: bad_json", f"TradingView stuurde geen geldige JSON. Raw={raw[:WEBHOOK_NOTIFY_RAW_MAX]}")
         return jsonify({"ok": True, "skip": "bad_json"}), 200
 
     action = (payload.get("action") or "").lower().strip()
     if action not in ["buy", "sell"]:
         _dbg(f"[SKIP] Invalid action '{action}'")
-        _record_webhook_event({"stage": "invalid_action", "payload": payload})
-        tg_webhook_notice("WEBHOOK geskipt: invalid_action", f"action='{action}' payload={str(payload)[:WEBHOOK_NOTIFY_RAW_MAX]}")
         return jsonify({"ok": True, "skipped": "invalid_action"}), 200
 
     tv_symbol_raw = payload.get("symbol") or ""
@@ -970,8 +731,6 @@ def webhook():
 
     if symbol != SYMBOL:
         _dbg(f"[SKIP] Unknown symbol '{symbol}' (raw='{tv_symbol_raw}')")
-        _record_webhook_event({"stage": "unknown_symbol", "symbol": symbol, "raw_symbol": tv_symbol_raw, "payload": payload})
-        tg_webhook_notice("WEBHOOK geskipt: unknown_symbol", f"raw='{tv_symbol_raw}' parsed='{symbol}' expected='{SYMBOL}'")
         return jsonify({"ok": True, "skip": "unknown_symbol"}), 200
 
     tf_raw = payload.get("tf") or ""
@@ -992,15 +751,12 @@ def webhook():
             price = 0.0
 
     source = payload.get("source", "unknown")
-    _record_webhook_event({"stage": "parsed", "action": action, "symbol": symbol, "tf": tf, "price": price, "source": source, "payload": payload})
 
     # Timeframe allowlist
     try:
         atfs = allowed_tfs_for(symbol)
         if tf not in atfs:
             _dbg(f"[TF FILTER] skip {symbol} tf={tf} not allowed ({', '.join(sorted(atfs))})")
-            _record_webhook_event({"stage": "tf_not_allowed", "symbol": symbol, "tf": tf, "allowed": sorted(atfs), "payload": payload})
-            tg_webhook_notice("WEBHOOK geskipt: tf_not_allowed", f"{symbol} tf={tf} allowed={', '.join(sorted(atfs))}")
             return jsonify({"ok": True, "skip": "tf_not_allowed"}), 200
     except Exception as e:
         _dbg(f"[TF FILTER] warn: {e}")
@@ -1023,10 +779,7 @@ def webhook():
 
     # Strict dedup
     if now - st.get("last_action_ts", 0) < STRICT_DEDUP_S:
-        age_s = now - st.get("last_action_ts", 0)
-        _dbg(f"[DEDUP] skip {symbol} too soon ({age_s:.2f}s)")
-        _record_webhook_event({"stage": "dedup", "symbol": symbol, "action": action, "age_s": age_s, "payload": payload})
-        tg_webhook_notice("WEBHOOK geskipt: dedup", f"{symbol} {action} te snel na vorige actie: {age_s:.2f}s")
+        _dbg(f"[DEDUP] skip {symbol} too soon ({now - st['last_action_ts']:.2f}s)")
         return jsonify({"ok": True, "skip": "dedup"}), 200
 
     # Per-bar lock (5m bars)
@@ -1045,8 +798,6 @@ def webhook():
     # Entry lockout / al in positie
     if action == "buy" and st.get("in_position", False):
         _dbg(f"[POS] skip {symbol} already in_position at entry={st.get('entry_price', 0)}")
-        _record_webhook_event({"stage": "in_position", "symbol": symbol, "action": action, "entry": st.get("entry_price", 0), "payload": payload})
-        tg_webhook_notice("BUY geskipt: al in positie", f"{symbol} entry={st.get('entry_price', 0)}")
         return jsonify({"ok": True, "skip": "in_position"}), 200
 
     # Min cooldown
@@ -1054,16 +805,13 @@ def webhook():
         _dbg(f"[COOLDOWN] skip {symbol} cooldown ({now - st['last_action_ts']:.2f}s)")
         return jsonify({"ok": True, "skip": "cooldown"}), 200
 
-    # Advisor / Quality Gate: alleen BUY wordt gefilterd. SELL blijft exit.
-    if action == "buy":
-        advisor = advisor_check_buy(symbol, price, source=source, tf=tf)
-        _dbg(f"[ADVISOR] allow={advisor.get('allow')} score={advisor.get('score')} reason={advisor.get('reason')}")
-        if not advisor.get("allow", False):
-            advisor_tg_skip(symbol, action, advisor)
-            return jsonify({"ok": True, "skip": "advisor_block", "advisor": advisor}), 200
-        if ADVISOR_USE_LIVE_PRICE and advisor.get("live_price", 0) > 0:
-            price = float(advisor["live_price"])
-        st["last_buy_htf_key"] = _advisor_htf_key(now)
+    # Extra bot-side filter op TV payload-indicatoren
+    allow, filter_reason = bot_filter_decision(action, price, payload)
+    if not allow:
+        _dbg(f"[BOT FILTER] skip {symbol} action={action} reason={filter_reason}")
+        return jsonify({"ok": True, "skip": "bot_filter", "reason": filter_reason}), 200
+    if filter_reason != "filter_disabled_or_not_buy":
+        _dbg(f"[BOT FILTER] pass {symbol} action={action} reason={filter_reason}")
 
     st["last_action_ts"] = now
 
@@ -1101,6 +849,11 @@ def _ensure_spend_buy(symbol: str, price: float, source: str = "", tf: str = "")
             st["entry_price"] = price
             st["qty"] = qty
             st["invested_usd"] = amount_usd
+            st["highest_price"] = price
+            st["be_armed"] = False
+            st["trail_armed"] = False
+            st["active_stop_price"] = price * (1.0 - HARD_SL_PCT / 100.0)
+            st["active_stop_reason"] = "hard_sl"
             _dbg(f"[PAPER BUY] {symbol} qty={qty} price={price} invested={amount_usd}")
             msg = tg_buy_msg(symbol, price, qty, amount_usd)
             send_tg(msg)
@@ -1133,6 +886,11 @@ def _ensure_spend_buy(symbol: str, price: float, source: str = "", tf: str = "")
             st["entry_price"] = avg if avg > 0 else price
             st["qty"] = filled
             st["invested_usd"] = net_in
+            st["highest_price"] = st["entry_price"]
+            st["be_armed"] = False
+            st["trail_armed"] = False
+            st["active_stop_price"] = st["entry_price"] * (1.0 - HARD_SL_PCT / 100.0)
+            st["active_stop_reason"] = "hard_sl"
 
             msg = tg_buy_msg(symbol, st["entry_price"], filled, net_in)
             send_tg(msg)
@@ -1168,8 +926,6 @@ def _market_sell_all(symbol: str, price: float, source: str = "", tf: str = "") 
     st = STATE[symbol]
     if not st.get("in_position", False):
         _dbg(f"[SELL] skip {symbol} no position")
-        _record_webhook_event({"stage": "sell_no_position", "symbol": symbol, "source": source, "tf": tf})
-        tg_webhook_notice("SELL geskipt: geen positie", f"{symbol} source={source} tf={tf}")
         return jsonify({"ok": True, "skip": "no_position"}), 200
 
     st["inflight"] = True
@@ -1233,16 +989,9 @@ def _market_sell_all(symbol: str, price: float, source: str = "", tf: str = "") 
             else:
                 pnl = net_out - invested
 
-        # Advisor leert van verlies: start loss-cooldown na verliestrade.
-        if pnl < 0:
-            STATE[symbol]["last_loss_ts"] = time.time()
-            STATE[symbol]["last_loss_pnl_usd"] = float(pnl)
-        else:
-            STATE[symbol]["last_win_ts"] = time.time()
-            STATE[symbol]["last_win_pnl_usd"] = float(pnl)
-
         # Wallet herverdelen: trade + savings + pnl
         trade_usd, savings_usd = trade_and_savings_usd(symbol)
+        prev_trade_usd, prev_savings_usd = trade_usd, savings_usd
         target_trade = float(STATE[symbol].get("target_trade_usd", trade_usd))
 
         total_capital = trade_usd + savings_usd + pnl
@@ -1255,8 +1004,9 @@ def _market_sell_all(symbol: str, price: float, source: str = "", tf: str = "") 
 
         STATE[symbol]["trade_usd"] = new_trade
         STATE[symbol]["savings_usd"] = new_savings
+        STATE[symbol]["realized_pnl_usd"] = float(STATE[symbol].get("realized_pnl_usd", 0.0)) + float(pnl)
 
-        msg = tg_sell_msg(symbol, avg if not SIMULATE else price, qty, net_out, pnl)
+        msg = tg_sell_msg(symbol, avg if not SIMULATE else price, qty, net_out, pnl, prev_trade_usd, prev_savings_usd)
         send_tg(msg)
 
         TRADE_LOG.append({
@@ -1276,6 +1026,11 @@ def _market_sell_all(symbol: str, price: float, source: str = "", tf: str = "") 
         st["entry_price"] = 0.0
         st["qty"] = 0.0
         st["invested_usd"] = 0.0
+        st["highest_price"] = 0.0
+        st["be_armed"] = False
+        st["trail_armed"] = False
+        st["active_stop_price"] = 0.0
+        st["active_stop_reason"] = ""
         st["last_action_ts"] = time.time()
 
         _save_state_file()
@@ -1293,7 +1048,6 @@ def _market_sell_all(symbol: str, price: float, source: str = "", tf: str = "") 
 if __name__ == "__main__":
     _dbg(f"[CONF] MEXC_RECV_WINDOW={MEXC_RECVWINDOW_MS} CCXT_TIMEOUT_MS={CCXT_TIMEOUT_MS}")
     _dbg(f"[CONF] SIMULATE={SIMULATE} REHYDRATE_ENABLED={REHYDRATE_ENABLED}")
-    _dbg(f"[CONF] ADVISOR_ENABLED={ADVISOR_ENABLED} MIN_SCORE={ADVISOR_MIN_SCORE} TF={ADVISOR_TF}")
     _load_state_file()
     try:
         init_exchange()
@@ -1308,4 +1062,12 @@ if __name__ == "__main__":
         _dbg("[REPORT] daily scheduler started")
     except Exception as e:
         _dbg(f"[REPORT] scheduler warn: {e}")
+
+    try:
+        t2 = Thread(target=_tpsl_monitor_loop, daemon=True)
+        t2.start()
+        _dbg(f"[TPSL] monitor started enabled={BOT_TPSL_ENABLED}")
+    except Exception as e:
+        _dbg(f"[TPSL] scheduler warn: {e}")
+
     app.run(host="0.0.0.0", port=PORT, debug=False)
