@@ -150,10 +150,87 @@ def payload_float(payload: Dict[str, Any], *keys: str) -> float | None:
     return None
 
 
-def pct_change(from_price: float, to_price: float) -> float:
-    if from_price <= 0:
-        return 0.0
-    return (to_price / from_price - 1.0) * 100.0
+def ema_series(values: List[float], length: int) -> List[float]:
+    if not values or length <= 0:
+        return []
+    k = 2.0 / (length + 1.0)
+    out = [float(values[0])]
+    for v in values[1:]:
+        out.append(float(v) * k + out[-1] * (1.0 - k))
+    return out
+
+
+def rsi_last(closes: List[float], length: int = 14) -> float | None:
+    if len(closes) <= length + 1:
+        return None
+    gains = []
+    losses = []
+    for i in range(1, len(closes)):
+        ch = closes[i] - closes[i - 1]
+        gains.append(max(ch, 0.0))
+        losses.append(max(-ch, 0.0))
+    avg_gain = sum(gains[:length]) / length
+    avg_loss = sum(losses[:length]) / length
+    for i in range(length, len(gains)):
+        avg_gain = (avg_gain * (length - 1) + gains[i]) / length
+        avg_loss = (avg_loss * (length - 1) + losses[i]) / length
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def atr_last(highs: List[float], lows: List[float], closes: List[float], length: int = 14) -> float | None:
+    if len(closes) <= length + 1:
+        return None
+    trs = []
+    for i in range(1, len(closes)):
+        trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
+    if len(trs) < length:
+        return None
+    atr = sum(trs[:length]) / length
+    for tr in trs[length:]:
+        atr = (atr * (length - 1) + tr) / length
+    return atr
+
+
+def adx_last(highs: List[float], lows: List[float], closes: List[float], length: int = 14) -> float | None:
+    if len(closes) <= length * 2 + 2:
+        return None
+    trs = []
+    plus_dm = []
+    minus_dm = []
+    for i in range(1, len(closes)):
+        up = highs[i] - highs[i - 1]
+        down = lows[i - 1] - lows[i]
+        plus_dm.append(up if up > down and up > 0 else 0.0)
+        minus_dm.append(down if down > up and down > 0 else 0.0)
+        trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
+    atr = sum(trs[:length])
+    pdm = sum(plus_dm[:length])
+    mdm = sum(minus_dm[:length])
+    dxs = []
+    for i in range(length, len(trs)):
+        atr = atr - (atr / length) + trs[i]
+        pdm = pdm - (pdm / length) + plus_dm[i]
+        mdm = mdm - (mdm / length) + minus_dm[i]
+        if atr <= 0:
+            continue
+        pdi = 100.0 * (pdm / atr)
+        mdi = 100.0 * (mdm / atr)
+        denom = pdi + mdi
+        if denom > 0:
+            dxs.append(100.0 * abs(pdi - mdi) / denom)
+    if len(dxs) < length:
+        return None
+    adx = sum(dxs[:length]) / length
+    for dx in dxs[length:]:
+        adx = (adx * (length - 1) + dx) / length
+    return adx
+
+
+def clamp(val: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, val))
 
 
 # ------------- wallet helpers -------------
@@ -214,7 +291,7 @@ def tg_buy_msg(symbol: str, price_usd: float, qty: float, invested_usd: float) -
     TG message voor BUY.
     """
     trade_usd, savings_usd = trade_and_savings_usd(symbol)
-    trade_eur = eur_rate() * trade_usd
+    trade_eur = eur_rate() * invested_usd
     now_str = fmt_dt(local_now())
     sym_ccxt = sym_label(symbol)
     lines = [
@@ -342,6 +419,24 @@ BE_TRIGGER_PCT = env_float("BE_TRIGGER_PCT", "0.60")    # break-even actief vana
 BE_OFFSET_PCT = env_float("BE_OFFSET_PCT", "0.05")      # BE stop op entry +0.05%
 TRAIL_TRIGGER_PCT = env_float("TRAIL_TRIGGER_PCT", "1.00")
 TRAIL_DISTANCE_PCT = env_float("TRAIL_DISTANCE_PCT", "0.45")
+
+# ------------- Supervisor v1: guard bovenop TradingView BUY-signalen -------------
+SUPERVISOR_ENABLED = env_bool("SUPERVISOR_ENABLED", "false")
+SUPERVISOR_FAIL_OPEN = env_bool("SUPERVISOR_FAIL_OPEN", "true")
+SUPERVISOR_NOTIFY = env_bool("SUPERVISOR_NOTIFY", "true")
+SUPERVISOR_TF = os.getenv("SUPERVISOR_TF", os.getenv("ADVISOR_TF", "10m"))
+SUPERVISOR_OHLCV_LIMIT = int(os.getenv("SUPERVISOR_OHLCV_LIMIT", os.getenv("ADVISOR_OHLCV_LIMIT", "260")))
+SUPERVISOR_MIN_SCORE = env_float("SUPERVISOR_MIN_SCORE", "0.55")
+SUPERVISOR_DYNAMIC_SIZE = env_bool("SUPERVISOR_DYNAMIC_SIZE", "true")
+SUPERVISOR_MIN_SIZE_FACTOR = env_float("SUPERVISOR_MIN_SIZE_FACTOR", "0.35")
+SUPERVISOR_REQUIRE_PRICE_ABOVE_EMA200 = env_bool("SUPERVISOR_REQUIRE_PRICE_ABOVE_EMA200", "false")
+SUPERVISOR_REQUIRE_EMA50_ABOVE_EMA200 = env_bool("SUPERVISOR_REQUIRE_EMA50_ABOVE_EMA200", "false")
+SUPERVISOR_MIN_ADX = env_float("SUPERVISOR_MIN_ADX", os.getenv("MIN_ADX", "18"))
+SUPERVISOR_RSI_MIN_LONG = env_float("SUPERVISOR_RSI_MIN_LONG", "50")
+SUPERVISOR_RSI_MAX_LONG = env_float("SUPERVISOR_RSI_MAX_LONG", "74")
+SUPERVISOR_MIN_ATR_PCT = env_float("SUPERVISOR_MIN_ATR_PCT", "0.05")
+SUPERVISOR_MAX_ATR_PCT = env_float("SUPERVISOR_MAX_ATR_PCT", "1.20")
+SUPERVISOR_MIN_VOLUME_FACTOR = env_float("SUPERVISOR_MIN_VOLUME_FACTOR", "0.75")
 
 # ✅ Symbol uit ENV (fallback BTC/USDT)
 SYMBOL = os.getenv("SYMBOL", "BTC/USDT")
@@ -508,6 +603,127 @@ def rehydrate_positions():
         _dbg(f"[REHYDRATE] Fetch error: {e}")
 
 
+def supervisor_size_factor(score: float) -> float:
+    if not SUPERVISOR_DYNAMIC_SIZE:
+        return 1.0
+    if score >= 0.75:
+        return 1.0
+    if score >= 0.65:
+        return 0.70
+    return SUPERVISOR_MIN_SIZE_FACTOR
+
+
+def supervisor_decision(action: str, symbol: str, price: float, payload: Dict[str, Any]) -> tuple[bool, str, float, float]:
+    """
+    Supervisor v1: alleen BUY bewaken. SELL wordt altijd doorgelaten.
+    Return: allow, reason, score, size_factor.
+    """
+    if not SUPERVISOR_ENABLED or action != "buy":
+        return True, "supervisor_disabled_or_not_buy", 1.0, 1.0
+
+    try:
+        if ex is None:
+            raise RuntimeError("exchange_client_not_ready")
+
+        tf = normalize_tf(SUPERVISOR_TF) or "10m"
+        ohlcv = ex.fetch_ohlcv(symbol, timeframe=tf, limit=max(80, SUPERVISOR_OHLCV_LIMIT))
+        if not ohlcv or len(ohlcv) < 80:
+            raise RuntimeError(f"not_enough_ohlcv:{len(ohlcv) if ohlcv else 0}")
+
+        highs = [float(x[2]) for x in ohlcv]
+        lows = [float(x[3]) for x in ohlcv]
+        closes = [float(x[4]) for x in ohlcv]
+        volumes = [float(x[5]) for x in ohlcv]
+        live_close = float(closes[-1])
+        check_price = price if price > 0 else live_close
+
+        ema50_s = ema_series(closes, 50)
+        ema200_s = ema_series(closes, 200)
+        ema50 = ema50_s[-1] if len(ema50_s) else live_close
+        ema200 = ema200_s[-1] if len(ema200_s) else live_close
+        ema200_old = ema200_s[-6] if len(ema200_s) > 6 else ema200
+        ema200_up = ema200 > ema200_old
+        rsi = rsi_last(closes, 14) or 50.0
+        atr = atr_last(highs, lows, closes, 14) or 0.0
+        atr_pct = (atr / live_close * 100.0) if live_close > 0 else 0.0
+        adx = adx_last(highs, lows, closes, 14) or 0.0
+        vol_ma = sum(volumes[-21:-1]) / 20.0 if len(volumes) >= 21 else max(volumes[-1], 1.0)
+        vol_factor = volumes[-1] / vol_ma if vol_ma > 0 else 1.0
+
+        checks = []
+        hard_blocks = []
+        score = 0.0
+
+        if check_price > ema200:
+            score += 0.18
+            checks.append("price>ema200")
+        elif SUPERVISOR_REQUIRE_PRICE_ABOVE_EMA200:
+            hard_blocks.append("price_below_ema200")
+
+        if ema50 > ema200:
+            score += 0.16
+            checks.append("ema50>ema200")
+        elif SUPERVISOR_REQUIRE_EMA50_ABOVE_EMA200:
+            hard_blocks.append("ema50_below_ema200")
+
+        if ema200_up:
+            score += 0.12
+            checks.append("ema200_up")
+
+        if SUPERVISOR_RSI_MIN_LONG <= rsi <= SUPERVISOR_RSI_MAX_LONG:
+            score += 0.16
+            checks.append("rsi_ok")
+        elif rsi > SUPERVISOR_RSI_MAX_LONG:
+            hard_blocks.append("rsi_too_high")
+        else:
+            hard_blocks.append("rsi_too_low")
+
+        if adx >= SUPERVISOR_MIN_ADX:
+            score += 0.12
+            checks.append("adx_ok")
+
+        if SUPERVISOR_MIN_ATR_PCT <= atr_pct <= SUPERVISOR_MAX_ATR_PCT:
+            score += 0.10
+            checks.append("atr_ok")
+        elif atr_pct > SUPERVISOR_MAX_ATR_PCT:
+            hard_blocks.append("atr_too_high")
+
+        if vol_factor >= SUPERVISOR_MIN_VOLUME_FACTOR:
+            score += 0.08
+            checks.append("volume_ok")
+
+        # Bonus voor signaal dichtbij actuele prijs, voorkomt oude/verkeerde alerts.
+        dev_pct = abs(check_price / live_close - 1.0) * 100.0 if live_close > 0 else 0.0
+        if dev_pct <= float(os.getenv("MAX_ALERT_PRICE_DEVIATION_PCT", "0.15")):
+            score += 0.08
+            checks.append("price_fresh")
+
+        score = clamp(score, 0.0, 1.0)
+        size = supervisor_size_factor(score)
+        allow = score >= SUPERVISOR_MIN_SCORE and not hard_blocks
+        reason = f"score={score:.2f} size={size:.2f} checks={','.join(checks) or '-'} blocks={','.join(hard_blocks) or '-'}"
+
+        if SUPERVISOR_NOTIFY:
+            decision = "ALLOW" if allow else "BLOCK"
+            send_tg(
+                "🤖 Supervisor " + decision + "\n" +
+                f"Signaal: BUY {sym_label(symbol)}\n" +
+                f"Score: {score:.2f} | Size: {size:.0%}\n" +
+                f"Prijs: {fmt_usd(check_price, 2)}\n" +
+                f"RSI: {rsi:.1f} | ADX: {adx:.1f} | ATR%: {atr_pct:.2f} | Vol: {vol_factor:.2f}x\n" +
+                f"Reden: {reason}"
+            )
+
+        return allow, reason, score, size
+
+    except Exception as e:
+        reason = f"supervisor_error:{e}"
+        _dbg(f"[SUPERVISOR] {reason}")
+        if SUPERVISOR_NOTIFY:
+            send_tg(f"🤖 Supervisor {'ALLOW' if SUPERVISOR_FAIL_OPEN else 'BLOCK'}\nReden: {reason}")
+        return SUPERVISOR_FAIL_OPEN, reason, 0.0, 1.0
+
+
 def bot_filter_decision(action: str, price: float, payload: Dict[str, Any]) -> tuple[bool, str]:
     """
     Extra bot-side filter. Werkt alleen als TV indicatorwaarden meestuurt.
@@ -652,6 +868,10 @@ def home():
         "bot_filter_enabled": BOT_FILTER_ENABLED,
         "bot_filter_missing": BOT_FILTER_MISSING,
         "bot_tpsl_enabled": BOT_TPSL_ENABLED,
+        "supervisor_enabled": SUPERVISOR_ENABLED,
+        "supervisor_min_score": SUPERVISOR_MIN_SCORE,
+        "supervisor_dynamic_size": SUPERVISOR_DYNAMIC_SIZE,
+        "supervisor_tf": SUPERVISOR_TF,
         "hard_sl_pct": HARD_SL_PCT,
         "be_trigger_pct": BE_TRIGGER_PCT,
         "trail_trigger_pct": TRAIL_TRIGGER_PCT,
@@ -675,6 +895,9 @@ def config():
         "per_bar_lock": PER_BAR_LOCK,
         "simulate": SIMULATE,
         "rehydrate_enabled": REHYDRATE_ENABLED,
+        "supervisor_enabled": SUPERVISOR_ENABLED,
+        "supervisor_min_score": SUPERVISOR_MIN_SCORE,
+        "bot_tpsl_enabled": BOT_TPSL_ENABLED,
     }), 200
 
 
@@ -813,6 +1036,24 @@ def webhook():
     if filter_reason != "filter_disabled_or_not_buy":
         _dbg(f"[BOT FILTER] pass {symbol} action={action} reason={filter_reason}")
 
+    # Supervisor v1: extra guard op BUY's. SELL altijd doorlaten.
+    sup_allow, sup_reason, sup_score, sup_size = supervisor_decision(action, symbol, price, payload)
+    STATE[symbol]["last_supervisor"] = {
+        "ts": time.time(),
+        "allow": bool(sup_allow),
+        "reason": sup_reason,
+        "score": float(sup_score),
+        "size_factor": float(sup_size),
+    }
+    if action == "buy":
+        STATE[symbol]["next_size_factor"] = float(sup_size)
+    if not sup_allow:
+        _dbg(f"[SUPERVISOR] skip {symbol} action={action} reason={sup_reason}")
+        _save_state_file()
+        return jsonify({"ok": True, "skip": "supervisor", "reason": sup_reason, "score": sup_score}), 200
+    if sup_reason != "supervisor_disabled_or_not_buy":
+        _dbg(f"[SUPERVISOR] pass {symbol} action={action} reason={sup_reason}")
+
     st["last_action_ts"] = now
 
     if action == "buy":
@@ -831,7 +1072,9 @@ def _ensure_spend_buy(symbol: str, price: float, source: str = "", tf: str = "")
 
     try:
         trade_usd, savings_usd = trade_and_savings_usd(symbol)
-        amount_usd = trade_usd
+        size_factor = clamp(float(st.pop("next_size_factor", 1.0)), 0.05, 1.0)
+        amount_usd = trade_usd * size_factor
+        st["last_size_factor"] = size_factor
 
         if amount_usd <= 0 or price <= 0:
             _dbg(f"[BUY] skip {symbol} invalid budget/price budget={amount_usd} price={price}")
