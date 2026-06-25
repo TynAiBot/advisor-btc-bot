@@ -207,6 +207,7 @@ CCXT_TIMEOUT_MS = int(os.getenv("CCXT_TIMEOUT_MS", "7000"))
 
 SIMULATE = env_bool("SIMULATE", "true")
 REHYDRATE_ENABLED = env_bool("REHYDRATE_ENABLED", "false")
+STARTUP_TG_ENABLED = env_bool("STARTUP_TG_ENABLED", "true")
 
 # Paper long/short controls
 ENABLE_LONGS = env_bool("ENABLE_LONGS", "true")
@@ -338,6 +339,34 @@ def send_tg(msg: str):
             _dbg("[TG] No token/chat_id - skipped")
     except Exception as e:
         _dbg(f"[TG] Send error: {e}")
+
+
+def tg_startup_msg() -> str:
+    """
+    Telegram startmelding bij Render deploy/restart.
+    """
+    st = STATE.get(SYMBOL, {})
+    pos_side = st.get("position_side", "none")
+    in_pos = bool(st.get("in_position", False))
+    active_stop = float(st.get("active_stop_price", 0.0) or 0.0)
+
+    lines = [
+        f"{BOT_TITLE}",
+        "🚀 Bot gestart",
+        f"📌 Symbol: {SYMBOL}",
+        f"🧪 Modus: {'PAPER' if SIMULATE else 'LIVE'}",
+        f"📈 Longs: {'AAN' if ENABLE_LONGS else 'UIT'}",
+        f"📉 Shorts: {'AAN' if ENABLE_SHORTS else 'UIT'}",
+        f"🛡️ TPSL: {'AAN' if BOT_TPSL_ENABLED else 'UIT'} | SL {HARD_SL_PCT:.2f}% | BE {BE_TRIGGER_PCT:.2f}% | Trail {TRAIL_TRIGGER_PCT:.2f}%/{TRAIL_DISTANCE_PCT:.2f}%",
+        f"🤖 Supervisor: {'AAN' if SUPERVISOR_ENABLED else 'UIT'} | Long min {SUPERVISOR_MIN_SCORE:.2f} | Short min {SUPERVISOR_MIN_SHORT_SCORE:.2f}",
+        f"💰 Budget: {fmt_usd(float(BUDGET_USDT.get(SYMBOL, 0.0)), 2)}",
+        f"🗂 State file: {STATE_FILE.name}",
+        f"📍 Positie: {'JA' if in_pos else 'NEE'} | Side: {pos_side}",
+    ]
+    if active_stop > 0:
+        lines.append(f"🛑 Actieve stop: {fmt_usd(active_stop, 2)}")
+    lines.append(f"🔗 Tijd: {fmt_dt(local_now())}")
+    return "\n".join(lines)
 
 
 def tg_open_msg(symbol: str, side: str, price_usd: float, qty: float, invested_usd: float, source: str) -> str:
@@ -982,4 +1011,12 @@ if __name__ == "__main__":
         _dbg(f"[TPSL] monitor started enabled={BOT_TPSL_ENABLED}")
     except Exception as e:
         _dbg(f"[TPSL] scheduler warn: {e}")
+
+    if STARTUP_TG_ENABLED:
+        try:
+            send_tg(tg_startup_msg())
+            _dbg("[STARTUP] Telegram startup message sent")
+        except Exception as e:
+            _dbg(f"[STARTUP] Telegram startup message error: {e}")
+
     app.run(host="0.0.0.0", port=PORT, debug=False)
