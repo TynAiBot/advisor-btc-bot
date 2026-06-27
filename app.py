@@ -208,6 +208,8 @@ CCXT_TIMEOUT_MS = int(os.getenv("CCXT_TIMEOUT_MS", "7000"))
 SIMULATE = env_bool("SIMULATE", "true")
 REHYDRATE_ENABLED = env_bool("REHYDRATE_ENABLED", "false")
 STARTUP_TG_ENABLED = env_bool("STARTUP_TG_ENABLED", "true")
+WEBHOOK_NOTIFY_SKIPS = env_bool("WEBHOOK_NOTIFY_SKIPS", "true")
+WEBHOOK_NOTIFY_RECEIVED = env_bool("WEBHOOK_NOTIFY_RECEIVED", "false")
 
 # Paper long/short controls
 ENABLE_LONGS = env_bool("ENABLE_LONGS", "true")
@@ -266,7 +268,7 @@ lock = Lock()
 # ---------------- logging / state ----------------
 
 def _dbg(msg: str):
-    print(f"[{datetime.now(timezone.utc).isoformat()}] {msg}")
+    print(f"[{datetime.now(timezone.utc).isoformat()}] {msg}", flush=True)
 
 
 def _save_state_file():
@@ -333,12 +335,42 @@ def send_tg(msg: str):
         chat_id = os.getenv("TELEGRAM_CHAT_ID")
         if token and chat_id:
             url = f"https://api.telegram.org/bot{token}/sendMessage"
-            requests.post(url, json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"}, timeout=5)
+            requests.post(url, json={"chat_id": chat_id, "text": msg}, timeout=5)
             _dbg("[TG] Message sent")
         else:
             _dbg("[TG] No token/chat_id - skipped")
     except Exception as e:
         _dbg(f"[TG] Send error: {e}")
+
+
+def tg_skip_msg(reason: str, action: str = "", symbol: str = "", price: float = 0.0, tf: str = "", source: str = "", extra: str = "") -> str:
+    st = STATE.get(symbol or SYMBOL, {})
+    in_pos = bool(st.get("in_position", False))
+    side = st.get("position_side", "none")
+    lines = [
+        f"{BOT_TITLE}",
+        "⚠️ Webhook overgeslagen",
+        f"Action: {action or '-'}",
+        f"Symbol: {symbol or '-'}",
+        f"TF: {tf or '-'}",
+        f"Prijs: {fmt_usd(price, 2) if price else '-'}",
+        f"Reden: {reason}",
+        f"Positie: {'JA' if in_pos else 'NEE'} | Side: {side}",
+    ]
+    if source:
+        lines.append(f"Bron: {source}")
+    if extra:
+        lines.append(f"Info: {extra}")
+    lines.append(f"Tijd: {fmt_dt(local_now())}")
+    return "\n".join(lines)
+
+
+def notify_skip(reason: str, action: str = "", symbol: str = "", price: float = 0.0, tf: str = "", source: str = "", extra: str = ""):
+    if WEBHOOK_NOTIFY_SKIPS:
+        try:
+            send_tg(tg_skip_msg(reason, action, symbol, price, tf, source, extra))
+        except Exception as e:
+            _dbg(f"[TG SKIP] notify error: {e}")
 
 
 def tg_startup_msg() -> str:
@@ -644,10 +676,13 @@ def open_position(symbol: str, side: str, price: float, source: str, tf: str) ->
     st["inflight"] = True
     try:
         if side == "long" and not ENABLE_LONGS:
+            notify_skip("longs_disabled", "long_entry", symbol, price, tf, source)
             return jsonify({"ok": True, "skip": "longs_disabled"}), 200
         if side == "short" and not ENABLE_SHORTS:
+            notify_skip("shorts_disabled", "short_entry", symbol, price, tf, source)
             return jsonify({"ok": True, "skip": "shorts_disabled"}), 200
         if side == "short" and not SIMULATE and not ALLOW_LIVE_SHORTS:
+            notify_skip("live_shorts_blocked", "short_entry", symbol, price, tf, source)
             return jsonify({"ok": True, "skip": "live_shorts_blocked"}), 200
 
         trade_usd, savings_usd = trade_and_savings_usd(symbol)
@@ -655,6 +690,7 @@ def open_position(symbol: str, side: str, price: float, source: str, tf: str) ->
         margin_usd = trade_usd * size_factor
         notional_usd = margin_usd * max(1.0, LEVERAGE)
         if margin_usd <= 0 or price <= 0:
+            notify_skip("invalid_budget_or_price", f"{side}_entry", symbol, price, tf, source, f"margin={margin_usd}")
             return jsonify({"ok": True, "skip": "invalid_budget_or_price"}), 200
 
         if SIMULATE:
@@ -713,10 +749,12 @@ def close_position(symbol: str, requested_side: str, price: float, source: str, 
     st = STATE[symbol]
     if not st.get("in_position", False):
         _dbg(f"[CLOSE] skip {symbol} no position")
+        notify_skip("no_position", f"{requested_side}_exit", symbol, price, tf, source)
         return jsonify({"ok": True, "skip": "no_position"}), 200
     side = st.get("position_side", "long")
     if requested_side != side:
         _dbg(f"[CLOSE] skip {symbol} side mismatch requested={requested_side} actual={side}")
+        notify_skip("side_mismatch", f"{requested_side}_exit", symbol, price, tf, source, f"actual_side={side}")
         return jsonify({"ok": True, "skip": "side_mismatch", "actual_side": side}), 200
 
     st["inflight"] = True
@@ -726,6 +764,7 @@ def close_position(symbol: str, requested_side: str, price: float, source: str, 
         notional_entry = float(st.get("notional_usd", qty * entry))
         entry_fee = float(st.get("entry_fee_usd", 0.0))
         if qty <= 0 or entry <= 0 or price <= 0:
+            notify_skip("invalid_position", f"{requested_side}_exit", symbol, price, tf, source, f"qty={qty} entry={entry}")
             return jsonify({"ok": True, "skip": "invalid_position"}), 200
 
         if SIMULATE:
@@ -863,6 +902,8 @@ def home():
         "supervisor_min_score": SUPERVISOR_MIN_SCORE,
         "supervisor_min_short_score": SUPERVISOR_MIN_SHORT_SCORE,
         "supervisor_dynamic_size": SUPERVISOR_DYNAMIC_SIZE,
+        "webhook_notify_skips": WEBHOOK_NOTIFY_SKIPS,
+        "webhook_notify_received": WEBHOOK_NOTIFY_RECEIVED,
     }), 200
 
 
@@ -882,6 +923,7 @@ def config():
         "allow_tfs": {SYMBOL: sorted(list(allowed_tfs_for(SYMBOL)))},
         "bot_tpsl_enabled": BOT_TPSL_ENABLED,
         "supervisor_enabled": SUPERVISOR_ENABLED,
+        "webhook_notify_skips": WEBHOOK_NOTIFY_SKIPS,
     }), 200
 
 
@@ -915,22 +957,27 @@ def webhook():
         _dbg("[PARSE] JSON loaded")
     except Exception:
         _dbg("[SIGDBG] bad_json")
+        notify_skip("bad_json", extra=raw[:200])
         return jsonify({"ok": True, "skip": "bad_json"}), 200
 
     action = normalize_action(payload.get("action") or "")
+    raw_action = payload.get("action") or ""
     if action not in ("long_entry", "long_exit", "short_entry", "short_exit"):
         _dbg(f"[SKIP] Invalid action '{action}'")
+        notify_skip("invalid_action", raw_action, extra=f"normalized={action}")
         return jsonify({"ok": True, "skipped": "invalid_action", "action": action}), 200
 
     symbol = parse_symbol(payload.get("symbol") or "")
     if symbol != SYMBOL:
         _dbg(f"[SKIP] Unknown symbol '{symbol}' raw='{payload.get('symbol')}'")
+        notify_skip("unknown_symbol", action, symbol, extra=f"raw_symbol={payload.get('symbol')}")
         return jsonify({"ok": True, "skip": "unknown_symbol"}), 200
 
     tf = normalize_tf(payload.get("tf") or "")
     try:
         if tf not in allowed_tfs_for(symbol):
             _dbg(f"[TF FILTER] skip {symbol} tf={tf} not allowed")
+            notify_skip("tf_not_allowed", action, symbol, 0.0, tf, payload.get("source", "unknown"), f"allowed={sorted(list(allowed_tfs_for(symbol)))}")
             return jsonify({"ok": True, "skip": "tf_not_allowed", "tf": tf}), 200
     except Exception as e:
         _dbg(f"[TF FILTER] warn: {e}")
@@ -943,9 +990,12 @@ def webhook():
         try:
             price = float(ex.fetch_ticker(symbol)["last"])
         except Exception:
+            notify_skip("invalid_price", action, symbol, price, tf, payload.get("source", "unknown"))
             return jsonify({"ok": True, "skip": "invalid_price"}), 200
 
     source = payload.get("source", "unknown")
+    if WEBHOOK_NOTIFY_RECEIVED:
+        send_tg(f"📩 Webhook ontvangen\nAction: {action}\nSymbol: {symbol}\nTF: {tf}\nPrijs: {fmt_usd(price,2)}\nBron: {source}\nTijd: {fmt_dt(local_now())}")
     side = action_side(action)
     now = time.time()
 
@@ -953,21 +1003,26 @@ def webhook():
     _ensure_wallet(symbol)
 
     if now - float(st.get("last_action_ts", 0)) < STRICT_DEDUP_S:
+        notify_skip("dedup", action, symbol, price, tf, source)
         return jsonify({"ok": True, "skip": "dedup"}), 200
 
     if PER_BAR_LOCK or (is_entry(action) and PER_BAR_LOCK_BUY) or (is_exit(action) and PER_BAR_LOCK_SELL):
         bar_time = int(now / 300) * 300
         if bar_time == st.get("last_bar_time", 0):
+            notify_skip("bar_lock", action, symbol, price, tf, source)
             return jsonify({"ok": True, "skip": "bar_lock"}), 200
         st["last_bar_time"] = bar_time
 
     if st.get("inflight", False):
+        notify_skip("inflight", action, symbol, price, tf, source)
         return jsonify({"ok": True, "skip": "inflight"}), 200
 
     if is_entry(action) and st.get("in_position", False):
+        notify_skip("already_in_position", action, symbol, price, tf, source, f"side={st.get('position_side')}")
         return jsonify({"ok": True, "skip": "already_in_position", "side": st.get("position_side")}), 200
 
     if now - float(st.get("last_action_ts", 0)) < MIN_TRADE_COOLDOWN_S:
+        notify_skip("cooldown", action, symbol, price, tf, source)
         return jsonify({"ok": True, "skip": "cooldown"}), 200
 
     if is_entry(action):
@@ -979,6 +1034,7 @@ def webhook():
         st["next_size_factor"] = float(sup_size)
         if not sup_allow:
             _dbg(f"[SUPERVISOR] skip {symbol} action={action} reason={sup_reason}")
+            notify_skip("supervisor", action, symbol, price, tf, source, f"score={sup_score:.2f} {sup_reason}")
             _save_state_file()
             return jsonify({"ok": True, "skip": "supervisor", "reason": sup_reason, "score": sup_score}), 200
 
