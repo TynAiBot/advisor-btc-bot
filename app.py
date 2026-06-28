@@ -474,6 +474,64 @@ def rehydrate_positions():
     _dbg("[REHYDRATE] live rehydrate for futures/short is not implemented in this paper L/S version")
 
 
+
+def mexc_interval_for_rest(tf: str) -> str:
+    """Map normalised timeframe to MEXC spot REST kline interval."""
+    tf = normalize_tf(tf)
+    mapping = {
+        "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+        "1h": "60m", "4h": "4h", "1d": "1d", "1w": "1W", "1M": "1M",
+    }
+    return mapping.get(tf, tf)
+
+
+def fetch_ohlcv_supervisor(symbol: str, tf: str, limit: int) -> List[List[float]]:
+    """
+    Fetch OHLCV for supervisor. Try ccxt first; if MEXC/ccxt fails, use
+    the public MEXC spot klines endpoint directly. Returns ccxt-like rows:
+    [timestamp, open, high, low, close, volume].
+    """
+    tf_norm = normalize_tf(tf) or "5m"
+    last_err = None
+    if ex is not None:
+        try:
+            return ex.fetch_ohlcv(symbol, timeframe=tf_norm, limit=limit)
+        except Exception as e:
+            last_err = e
+            _dbg(f"[SUPERVISOR] ccxt OHLCV failed tf={tf_norm}: {e}")
+
+    # direct public MEXC fallback
+    sym = symbol.replace("/", "")
+    interval = mexc_interval_for_rest(tf_norm)
+    url = "https://api.mexc.com/api/v3/klines"
+    params = {"symbol": sym, "interval": interval, "limit": int(limit)}
+    try:
+        r = requests.get(url, params=params, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list):
+            raise RuntimeError(f"unexpected_klines_response:{str(data)[:120]}")
+        out = []
+        for row in data:
+            if len(row) < 6:
+                continue
+            out.append([
+                int(row[0]),
+                float(row[1]),
+                float(row[2]),
+                float(row[3]),
+                float(row[4]),
+                float(row[5]),
+            ])
+        if not out:
+            raise RuntimeError("empty_klines_after_parse")
+        _dbg(f"[SUPERVISOR] direct MEXC klines ok tf={tf_norm}/{interval} rows={len(out)}")
+        return out
+    except Exception as e:
+        if last_err:
+            raise RuntimeError(f"ohlcv_failed ccxt={last_err} direct={e}")
+        raise
+
 # ---------------- supervisor ----------------
 
 def supervisor_size_factor(score: float) -> float:
@@ -494,7 +552,7 @@ def supervisor_decision(action: str, symbol: str, price: float, payload: Dict[st
         if ex is None:
             raise RuntimeError("exchange_client_not_ready")
         tf = normalize_tf(SUPERVISOR_TF) or "10m"
-        ohlcv = ex.fetch_ohlcv(symbol, timeframe=tf, limit=max(80, SUPERVISOR_OHLCV_LIMIT))
+        ohlcv = fetch_ohlcv_supervisor(symbol, tf, max(80, SUPERVISOR_OHLCV_LIMIT))
         if not ohlcv or len(ohlcv) < 80:
             raise RuntimeError(f"not_enough_ohlcv:{len(ohlcv) if ohlcv else 0}")
         highs = [float(x[2]) for x in ohlcv]
