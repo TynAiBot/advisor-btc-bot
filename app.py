@@ -487,26 +487,21 @@ def mexc_interval_for_rest(tf: str) -> str:
 
 def fetch_ohlcv_supervisor(symbol: str, tf: str, limit: int) -> List[List[float]]:
     """
-    Fetch OHLCV for supervisor. Try ccxt first; if MEXC/ccxt fails, use
-    the public MEXC spot klines endpoint directly. Returns ccxt-like rows:
+    Fetch OHLCV for supervisor. Direct MEXC REST first, because ccxt/MEXC
+    can be slow/fail on Render and that can make TradingView mark the
+    webhook as timed out. Returns ccxt-like rows:
     [timestamp, open, high, low, close, volume].
     """
     tf_norm = normalize_tf(tf) or "5m"
-    last_err = None
-    if ex is not None:
-        try:
-            return ex.fetch_ohlcv(symbol, timeframe=tf_norm, limit=limit)
-        except Exception as e:
-            last_err = e
-            _dbg(f"[SUPERVISOR] ccxt OHLCV failed tf={tf_norm}: {e}")
-
-    # direct public MEXC fallback
     sym = symbol.replace("/", "")
     interval = mexc_interval_for_rest(tf_norm)
     url = "https://api.mexc.com/api/v3/klines"
     params = {"symbol": sym, "interval": interval, "limit": int(limit)}
+    direct_err = None
+
+    # Preferred path: direct public MEXC klines. Fast and does not need account/API key.
     try:
-        r = requests.get(url, params=params, timeout=8)
+        r = requests.get(url, params=params, timeout=4)
         r.raise_for_status()
         data = r.json()
         if not isinstance(data, list):
@@ -528,9 +523,20 @@ def fetch_ohlcv_supervisor(symbol: str, tf: str, limit: int) -> List[List[float]
         _dbg(f"[SUPERVISOR] direct MEXC klines ok tf={tf_norm}/{interval} rows={len(out)}")
         return out
     except Exception as e:
-        if last_err:
-            raise RuntimeError(f"ohlcv_failed ccxt={last_err} direct={e}")
-        raise
+        direct_err = e
+        _dbg(f"[SUPERVISOR] direct MEXC klines failed tf={tf_norm}/{interval}: {e}")
+
+    # Fallback only: ccxt fetch_ohlcv.
+    if ex is not None:
+        try:
+            out = ex.fetch_ohlcv(symbol, timeframe=tf_norm, limit=limit)
+            _dbg(f"[SUPERVISOR] ccxt OHLCV fallback ok tf={tf_norm} rows={len(out) if out else 0}")
+            return out
+        except Exception as e:
+            raise RuntimeError(f"ohlcv_failed direct={direct_err} ccxt={e}")
+
+    raise RuntimeError(f"ohlcv_failed direct={direct_err} ccxt=no_exchange_client")
+
 
 # ---------------- supervisor ----------------
 
@@ -910,7 +916,9 @@ def _tpsl_monitor_loop():
             triggered = (price <= stop) if side == "long" else (price >= stop)
             if triggered:
                 _dbg(f"[TPSL] trigger {symbol} side={side} reason={reason} price={price} stop={stop}")
-                close_position(symbol, side, price, source=f"bot_tpsl_{reason}", tf="bot")
+                # close_position returns jsonify responses; background threads need an app context.
+                with app.app_context():
+                    close_position(symbol, side, price, source=f"bot_tpsl_{reason}", tf="bot")
         except Exception as e:
             _dbg(f"[TPSL] loop error: {e}")
             time.sleep(10)
